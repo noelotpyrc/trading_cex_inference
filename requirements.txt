@@ -1,0 +1,12 @@
+# ML inference
+lightgbm>=4.0.0
+
+# Data processing
+pandas>=2.0.0
+numpy>=1.24.0
+
+# Database
+duckdb>=0.9.0
+
+# Utils
+python-dateutil>=2.8.0

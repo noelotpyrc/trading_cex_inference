@@ -167,17 +167,20 @@ def _load_features_for_timestamp(
     con: duckdb.DuckDBPyConnection,
     ts: pd.Timestamp,
     feature_key: Optional[str] = None
-) -> Optional[dict]:
+) -> tuple[Optional[dict], Optional[str]]:
     """Load pre-computed features for a timestamp.
 
     If feature_key is specified, loads most recent features for that key.
     Otherwise, loads most recent features across all keys (dedup by created_at DESC).
+
+    Returns:
+        (features_dict, feature_key_used)
     """
     try:
         if feature_key:
             # Get features for specific feature_key
             q = """
-                SELECT features
+                SELECT features, feature_key
                 FROM features
                 WHERE feature_key = ?
                   AND ts = ?
@@ -186,29 +189,28 @@ def _load_features_for_timestamp(
             """
             row = con.execute(q, [feature_key, ts.to_pydatetime()]).fetchone()
         else:
-            # Get most recent features regardless of key
+            # Get most recent features regardless of key (return the key used)
             q = """
-                SELECT features
-                FROM (
-                    SELECT features, created_at,
-                           ROW_NUMBER() OVER (PARTITION BY ts ORDER BY created_at DESC) as rn
-                    FROM features
-                    WHERE ts = ?
-                ) sub
-                WHERE rn = 1
+                SELECT features, feature_key
+                FROM features
+                WHERE ts = ?
+                ORDER BY created_at DESC
+                LIMIT 1
             """
             row = con.execute(q, [ts.to_pydatetime()]).fetchone()
 
         if not row:
-            return None
+            return None, None
 
         features_json = row[0]
+        used_feature_key = row[1]
+
         if isinstance(features_json, str):
-            return json.loads(features_json)
-        return features_json
+            return json.loads(features_json), used_feature_key
+        return features_json, used_feature_key
     except Exception as e:
         print(f"ERROR loading features for {ts}: {e}")
-        return None
+        return None, None
 
 
 def _list_closed_bars_in_window(
@@ -306,11 +308,21 @@ def _save_prediction(
         [ts.to_pydatetime(), model_path]
     )
 
-    # Insert new prediction
-    con.execute(
-        "INSERT INTO predictions (ts, model_path, y_pred, feature_key, dataset) VALUES (?, ?, ?, ?, ?)",
-        [ts.to_pydatetime(), model_path, float(y_pred), feature_key, dataset]
-    )
+    # Check if dataset column exists
+    schema = con.execute("DESCRIBE predictions").fetchall()
+    has_dataset = any(col[0] == 'dataset' for col in schema)
+
+    # Insert new prediction (with or without dataset column)
+    if has_dataset:
+        con.execute(
+            "INSERT INTO predictions (ts, model_path, y_pred, feature_key, dataset) VALUES (?, ?, ?, ?, ?)",
+            [ts.to_pydatetime(), model_path, float(y_pred), feature_key, dataset]
+        )
+    else:
+        con.execute(
+            "INSERT INTO predictions (ts, model_path, y_pred, feature_key) VALUES (?, ?, ?, ?)",
+            [ts.to_pydatetime(), model_path, float(y_pred), feature_key]
+        )
 
 
 def _resolve_model_path(model_path: Path) -> Path:
@@ -508,8 +520,8 @@ def backfill_inference(cfg: BackfillInferenceConfig) -> int:
                 print(f"SKIP {ts}: prediction already exists")
                 continue
 
-            # Load features
-            features_dict = _load_features_for_timestamp(con_feat, ts, cfg.feature_key)
+            # Load features (returns features dict and actual feature_key used)
+            features_dict, used_feature_key = _load_features_for_timestamp(con_feat, ts, cfg.feature_key)
             if not features_dict:
                 print(f"SKIP {ts}: no features found")
                 continue
@@ -534,11 +546,11 @@ def backfill_inference(cfg: BackfillInferenceConfig) -> int:
                 print(f"SKIP {ts}: prediction failed ({e})")
                 continue
 
-            # Save prediction
+            # Save prediction (use the actual feature_key that was used)
             try:
                 _save_prediction(
                     con_pred, ts, y_pred, str(resolved_model_path),
-                    cfg.feature_key, cfg.dataset
+                    used_feature_key, cfg.dataset
                 )
                 processed += 1
                 print(f"OK {ts}: prediction={y_pred:.6f}")
